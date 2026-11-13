@@ -1,7 +1,8 @@
-"""Box office revenue predicto.
+"""Box office revenue predictor.
 
-Predicts a film's domestic revenue from opening theaters, distributor, rating,
-and genres. The target is log-transformed because revenue is heavily skewed.
+Predicts a film's domestic revenue from opening theaters, budget, distributor,
+rating, and genres. The target is log-transformed because revenue is heavily
+skewed. Always compare the model against a simple baseline before trusting it.
 """
 import matplotlib.pyplot as plt
 import numpy as np
@@ -51,36 +52,50 @@ def main():
     print("Shape:", df.shape)
     df.info()
 
+    # Sanity check: do titles, ratings, genres, and revenues look believable?
+    # If a famous film has the wrong rating or genre, those columns may be noise.
+    check_cols = [c for c in ["title", "MPAA", "genres", "domestic_revenue",
+                              "world_revenue", "budget"] if c in df.columns]
+    print("\nRandom sample for a data sanity check:")
+    print(df[check_cols].sample(10, random_state=RANDOM_STATE).to_string())
+
     # --- 2. Clean ---
     # world_revenue and opening_revenue are only known after release and are
     # tightly tied to the target, so using them would be data leakage.
-    # budget is dropped because it has many missing values.
-    to_drop = ["world_revenue", "opening_revenue", "budget"]
+    to_drop = ["world_revenue", "opening_revenue"]
     if DROP_RELEASE_DAYS:
         to_drop.append("release_days")
     df = df.drop(columns=to_drop, errors="ignore")
 
-    numeric_cols = [c for c in ["domestic_revenue", "opening_theaters", "release_days"]
-                    if c in df.columns]
+    numeric_cols = [c for c in ["domestic_revenue", "opening_theaters",
+                                "release_days", "budget"] if c in df.columns]
     for col in numeric_cols:
         df[col] = to_number(df[col])
+
+    # In many box office files a budget of 0 really means "unknown".
+    zero_budget = int((df["budget"] == 0).sum())
+    print(f"\nRows with budget == 0 (treated as missing): {zero_budget}")
+    df.loc[df["budget"] == 0, "budget"] = np.nan
+    df["budget_missing"] = df["budget"].isna().astype(int)
 
     # Fill missing categoricals with the most common value.
     for col in ["MPAA", "genres"]:
         df[col] = df[col].fillna(df[col].mode()[0])
 
-    # Drop rows still missing values, AFTER the numeric conversion so that any
-    # values turned into NaN by the conversion are also removed.
-    df = df.dropna().reset_index(drop=True)
+    # Drop rows missing anything except budget (XGBoost handles missing budget).
+    # This runs AFTER the numeric conversion, so values that became NaN there
+    # are removed too.
+    required = [c for c in df.columns if c != "budget"]
+    df = df.dropna(subset=required).reset_index(drop=True)
     print("Rows after cleaning:", len(df))
 
     # --- 3. Target and log transform ---
     # log1p handles zeros safely (log(1 + x)). Convert back with expm1.
     y = np.log1p(df["domestic_revenue"])
     X = df.drop(columns=["title", "domestic_revenue"])
-    X["opening_theaters"] = np.log1p(X["opening_theaters"])
-    if "release_days" in X.columns:
-        X["release_days"] = np.log1p(X["release_days"])
+    for col in ["opening_theaters", "release_days", "budget"]:
+        if col in X.columns:
+            X[col] = np.log1p(X[col])
 
     if SHOW_PLOTS:
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -97,7 +112,8 @@ def main():
     )
 
     # --- 5. Preprocessing + model in one pipeline ---
-    numeric_features = [c for c in ["opening_theaters", "release_days"] if c in X.columns]
+    numeric_features = [c for c in ["opening_theaters", "release_days",
+                                    "budget", "budget_missing"] if c in X.columns]
     preprocess = ColumnTransformer(
         [
             # Genres -> one 0/1 column per genre. min_df=0.05 drops genres that
@@ -111,9 +127,18 @@ def main():
         ]
     )  # No feature scaling: tree models don't need it.
 
-    model = Pipeline(
-        [("prep", preprocess), ("xgb", XGBRegressor(random_state=RANDOM_STATE))]
+    # Smaller, more regularized trees than the XGBoost defaults, because the
+    # defaults overfit on a dataset this size.
+    xgb = XGBRegressor(
+        max_depth=3,
+        n_estimators=200,
+        learning_rate=0.05,
+        min_child_weight=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=RANDOM_STATE,
     )
+    model = Pipeline([("prep", preprocess), ("xgb", xgb)])
 
     # --- 6. Compare against a baseline, with cross-validation ---
     baseline = DummyRegressor(strategy="median").fit(X_train, y_train)
@@ -129,6 +154,8 @@ def main():
     report("Baseline (median)", y_test, baseline.predict(X_test))
     report("XGBoost (train)", y_train, model.predict(X_train))
     report("XGBoost (test)", y_test, model.predict(X_test))
+    print("\nA good sign: the test error is clearly below the baseline's, "
+          "and the train/test gap is small.")
 
     # --- 7. What drives the predictions? ---
     names = model.named_steps["prep"].get_feature_names_out()
